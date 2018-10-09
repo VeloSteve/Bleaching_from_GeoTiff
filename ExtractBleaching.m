@@ -1,0 +1,167 @@
+% Read a geotiff
+%
+% The target is the bleaching probability geotiffs described in
+% Donner, Simon D., Gregory J. M. Rickbeil, and Scott F. Heron. 2017. 
+% “A New, High-Resolution Global Mass Coral Bleaching Database.” Plos One 12
+% (4):e0175490. https://doi.org/10.1371/journal.pone.0175490.
+%
+%"The resulting 0.04? × 0.04? gridded probability maps are presented here. The maps were
+% also re-projected onto the initial reefpolygon map from the Millennium Coral ReefMapping
+% Project to calculate the area of reefs with different probabilities of bleaching in each year."
+% Values in A are mostly -1.7e+308, but otherwise range from 0, through some
+% tiny values as low as 6.0587E-17 to a max of 0.91419 (based on 1987).
+% The negative values appears 26888000 times, zero 65,104 times, and the other
+% values (4124 distinct values) once each.  This pattern may vary in other
+% years.
+% x spans [-20037507.0671618] to  [20032870.1911020] (8640 values)
+% y spans   [7792364.47130142] to [-6674530.61707974] (3120 values)
+% Still need to find out the units and datum for these.
+% Units appear to be meters (I get 6377.4 as the earth's radius, often quoted as
+% 6378).
+% One x pixel is 4.6378 km wide. Using the same approach,
+% one y pixes is 4.6368 km high.
+year = 1998;
+[A, x, y, I] = geoimread(strcat('../Donner_hide/World_', num2str(year), '.tif'));
+
+% Convert x and y to lat and lon, using a simple approach which may be replaced.
+% Assume that the x values evenly divide 360 degrees, with zero at the date
+% line.
+% Assume that same meter-to-degrees scaling applies north-south.
+degreesPerMeter = 360.0/(max(x) - min(x));
+
+% NOTE: m_map works best if longitudes are all positive.
+xLon = x * degreesPerMeter + 180.0;
+% If traditional +- longitudes are wanted:
+% xLon = x * degreesPerMeter - sign(x)*180;
+yLat = y * degreesPerMeter; 
+
+% There are a LOT of negative values.  Make a quick pass to drop rows or columns
+% with nothing useful:
+colMax = max(A, [], 1);
+idx = find(colMax >= 0);
+fprintf('Removing %d of %d columns with no useful values.\n', length(colMax)-length(idx), length(colMax));
+xLon = xLon(idx);
+A = A(:, idx);  % note that A is y by x
+% Maybe less payoff, but see what can be saved by removing rows the same way.
+rowMax = max(A, [], 2);
+idx = find(rowMax >= 0);
+fprintf('Removing %d of %d rows with no useful values.\n', length(rowMax)-length(idx), length(rowMax));
+yLat = yLat(idx);
+A = A(idx, :);  % note that A is y by x
+
+%% From here, but sure to use only arrays which have been downsized!  These
+%  are xLon, yLat, and A.
+%%
+% Plot just points with values well above zero.
+plotPoints = zeros(100000, 2);
+plotValues = zeros(100000, 1);
+point = 0;
+for i = 1:length(xLon)
+    for j = 1:length(yLat)
+        if A(j, i) > 0.001
+            point = point + 1;
+            plotPoints(point, 1) = xLon(i);
+            plotPoints(point, 2) = yLat(j);
+            plotValues(point) = A(j, i);
+        end
+    end
+end
+point
+
+plotPoints = plotPoints(1:point, 1:2);
+plotValues = plotValues(1:point);
+
+MapGeneration(plotPoints, plotValues, year)
+
+% Now get the Logan cells
+load(strcat('../Coral-Model-Data/ProjectionsPaper/', 'ESM2M_SSTR_JD.mat'), 'ESM2M_reefs_JD');
+
+% Since the Donner points are now in 0-360 coordinates, do the same with the
+% cells.  This is preferred because there are no reefs on the prime meridian.
+cellLon = ESM2M_reefs_JD(:, 1);
+cellLat = ESM2M_reefs_JD(:, 2);
+idx = find(cellLon < 0);
+% Flip to a 0-360 longitude scale.
+cellLon(idx) = cellLon(idx) + 360.0;
+
+reefCount = 1925;
+cell(length(yLat), length(xLon)) = NaN;  % Initialize array for associating each probability with a reef cell.
+points = zeros(reefCount, 1); % and count how many points are assigned to each cell
+
+% Check every point which fits.
+% But sort cells by longitude first so we can skip irrelevant parts.
+[cellLonSort, lonIndex] = sort(cellLon);
+cellLatSort = cellLat(lonIndex); % not sorted by latitude, but it matches the longitude array.
+reefNumber = lonIndex; 
+
+firstXLon = 1;
+cellLeft = cellLonSort - 0.5;
+for k = 1:reefCount
+    fprintf("Reef: %d \n", k);
+    foundLon = 0;
+    newFirstX = length(xLon);
+    for i = firstXLon:length(xLon)
+        if cellLeft(k) <= xLon(i)
+            if cellLeft(k) + 1.0 < xLon(i)
+                fprintf('Done at i = %d\n', i);
+                break;
+            else
+                foundLon = 1;
+                newFirstX = min(i, newFirstX);
+                for j = 1:length(yLat)
+                    if (abs(yLat(j) - cellLatSort(k)) < 0.5) && A(j, i) >= 0
+                        cell(j, i) = reefNumber(k);
+                        points(k) = points(k) + 1;
+                        % This is the value we will average(?) to get
+                        % bleaching probabilities.
+                        % aval = A(j, i);
+                    end
+                end
+            end
+        end
+    end
+    if foundLon
+        firstXLon = newFirstX;
+    end
+end
+
+% If negative values are included, the quantiles of points matched to each
+% reef look like this (for 1, 5, 25, 50, 75, 95, and 99 percent)
+%    72   216   552   576   576   576   576
+% But excluding negatives, we get
+%    0     1     8    26    59   141.25  205.25
+% And excluding zeros:
+%    0     0     0    13    44   131     204
+% Note that NaN values are excluded in all cases.
+
+% To check: sum(points) is not equal to the number of points with a cell
+% association.  i.e. length(find(cell > 0)) = 57451 != sum(points) = 81508.
+% Why?
+% If points are matched more than once, the find value won't go up but "points"
+% counts will.  
+
+
+%{
+for k = 1:reefCount
+    fprintf("Reef: %d \n", k);
+    foundLon = 0;
+    for i = 1:length(xLon)
+        if abs(xLon(i) - cellLon(k)) < 0.5
+            foundLon = 1;
+            for j = 1:length(yLat)
+                if abs(yLat(j) - cellLat(k)) < 0.5
+                    cell(i, j) = k;
+                    points(k) = points(k) + 1;
+                end
+            end
+        elseif foundLon == 1
+            fprintf('Done at i = %d\n', i);
+            break;  % passed the matching area - move to next reef;
+        end
+    end
+end
+%}
+
+
+
+
